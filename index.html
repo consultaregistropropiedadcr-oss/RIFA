@@ -175,6 +175,10 @@ body{
 .winner.show{display:block}
 .winner .wlabel{font-family:"Oswald",sans-serif;letter-spacing:.24em;text-transform:uppercase;font-size:12px;color:var(--gold)}
 .winner .wname{font-family:"Oswald",sans-serif;font-weight:700;font-size:26px;color:#fff;margin-top:6px;min-height:32px}
+.winner .wmeta{font-family:"Space Mono",monospace;font-size:12.5px;color:#C9C2DF;margin-top:8px;line-height:1.7}
+.draw-stats{margin-top:12px;font-size:13px;color:var(--text-soft);text-align:center;min-height:18px}
+.dedupe-row{display:flex;align-items:center;gap:9px;font-size:13.5px;color:var(--ink);margin-top:12px;cursor:pointer;user-select:none}
+.dedupe-row input{width:auto;accent-color:var(--gold-deep)}
 .tabbar{display:flex;gap:8px;justify-content:center;margin-top:10px}
 
 #confetti{position:fixed;inset:0;pointer-events:none;z-index:60;display:none}
@@ -307,15 +311,18 @@ body{
 
   <section class="card" id="drawCard">
     <h2>Sorteo</h2>
-    <p class="sub">Pegá los participantes que te llegaron (uno por línea) y girá para sacar al ganador.</p>
-    <textarea class="draw-input" id="drawList" placeholder="María Rodríguez — 8888 8888&#10;José Pérez — factura 00123&#10;..."></textarea>
+    <p class="sub">Pegá los mensajes de WhatsApp tal cual te llegaron (uno o varios, todos juntos). La app detecta a cada participante, quita duplicados y elige al ganador. También sirve una lista simple: un nombre por línea.</p>
+    <textarea class="draw-input" id="drawList" placeholder="Pegá aquí los registros, por ejemplo:&#10;&#10;👤 Nombre: María Rodríguez Mora&#10;🪪 Cédula: 70123456&#10;📞 Teléfono: 8888 8888&#10;🏪 Supermercado: WZ&#10;🧾 Tiquete/Factura: 00123&#10;&#10;👤 Nombre: José Pérez ..."></textarea>
+    <label class="dedupe-row"><input type="checkbox" id="dedupeChk" checked> Quitar duplicados (misma cédula o teléfono)</label>
     <div class="btnrow">
-      <button class="btn gold" id="spinBtn">Girar y sortear</button>
+      <button class="btn gold" id="spinBtn">Detectar y sortear</button>
       <button class="btn ghost sm" id="clearWinner">Limpiar</button>
     </div>
+    <div class="draw-stats" id="drawStats"></div>
     <div class="winner" id="winnerBox">
       <div class="wlabel">Ganador(a)</div>
       <div class="wname" id="winnerName"></div>
+      <div class="wmeta" id="winnerMeta"></div>
     </div>
   </section>
 
@@ -2776,7 +2783,10 @@ var qrcode = function() {
       $("printQr").addEventListener("click", function(){ window.print(); });
       $("spinBtn").addEventListener("click", spin);
       $("clearWinner").addEventListener("click", function(){
-        $("winnerBox").classList.remove("show"); $("winnerName").textContent = "";
+        $("winnerBox").classList.remove("show");
+        $("winnerName").textContent = "";
+        $("winnerMeta").textContent = "";
+        $("drawStats").textContent = "";
       });
     }
     refreshAdmin();
@@ -2816,25 +2826,107 @@ var qrcode = function() {
 
   // ====== Sorteo ======
   var spinning = false;
+
+  function noAccents(s){ return (s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase(); }
+
+  // Quita el prefijo de exportación de WhatsApp: "[fecha, hora] Remitente: " o "fecha, hora - Remitente: "
+  function stripWaPrefix(line){
+    var m = line.match(/^\s*\[[^\]]+\]\s*[^:]*:\s*(.*)$/);
+    if (m) return m[1];
+    m = line.match(/^\s*\d{1,2}\/\d{1,2}\/\d{2,4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:[ap]\.?\s*m\.?)?\s*-\s*[^:]*:\s*(.*)$/i);
+    if (m) return m[1];
+    return line;
+  }
+
+  // Detecta "Etiqueta: valor" quitando asteriscos y emojis
+  function fieldOf(rawLine){
+    var l = stripWaPrefix(rawLine).replace(/\*/g, "").trim();
+    var idx = l.indexOf(":"); if (idx < 0) idx = l.indexOf("：");
+    if (idx < 0) return null;
+    var key = noAccents(l.slice(0, idx)).replace(/[^a-z\/ ]/g, "").trim();
+    var val = l.slice(idx + 1).trim();
+    if (!key) return null;
+    return { key: key, val: val };
+  }
+
+  function parseParticipants(text, dedupe){
+    var lines = text.split(/\r?\n/);
+    var recs = [], cur = null, sawLabels = false;
+    function push(){ if (cur && cur.nombre) recs.push(cur); cur = null; }
+    lines.forEach(function(raw){
+      var f = fieldOf(raw);
+      if (!f) return;
+      if (f.key.indexOf("nombre") >= 0){
+        sawLabels = true; push();
+        cur = { nombre:f.val, cedula:"", telefono:"", supermercado:"", ticket:"" };
+      } else if (cur){
+        if (f.key.indexOf("cedula") >= 0){ cur.cedula = f.val; sawLabels = true; }
+        else if (f.key.indexOf("telefono") >= 0){ cur.telefono = f.val; sawLabels = true; }
+        else if (f.key.indexOf("supermercado") >= 0){ cur.supermercado = f.val; sawLabels = true; }
+        else if (f.key.indexOf("tiquete") >= 0 || f.key.indexOf("factura") >= 0){ cur.ticket = f.val; sawLabels = true; }
+      }
+    });
+    push();
+    // Sin etiquetas: cada línea no vacía es un participante (lista simple)
+    if (!sawLabels){
+      recs = lines.map(function(s){ return s.trim(); }).filter(Boolean)
+        .map(function(n){ return { nombre:n, cedula:"", telefono:"", supermercado:"", ticket:"" }; });
+    }
+    var dupes = 0;
+    if (dedupe){
+      var seen = {}, out = [];
+      recs.forEach(function(r){
+        var key = digits(r.cedula) || digits(r.telefono) || noAccents(r.nombre).replace(/\s+/g," ").trim();
+        if (key && seen[key]){ dupes++; return; }
+        if (key) seen[key] = true;
+        out.push(r);
+      });
+      recs = out;
+    }
+    return { list: recs, dupes: dupes };
+  }
+
+  function plural(n, s){ return n + " " + s + (n === 1 ? "" : "s"); }
+
+  function showWinner(rec){
+    $("winnerName").textContent = rec.nombre;
+    var meta = [];
+    if (rec.telefono) meta.push("📞 " + rec.telefono);
+    if (rec.supermercado) meta.push("🏪 " + rec.supermercado);
+    if (rec.ticket) meta.push("🧾 " + rec.ticket);
+    $("winnerMeta").textContent = meta.join("    ");
+  }
+
   function spin(){
     if (spinning) return;
-    var list = $("drawList").value.split("\n").map(function(s){return s.trim();}).filter(Boolean);
+    var parsed = parseParticipants($("drawList").value, $("dedupeChk").checked);
+    var list = parsed.list;
+
+    $("drawStats").textContent = list.length
+      ? plural(list.length, "participante") + (parsed.dupes ? "  ·  " + plural(parsed.dupes, "duplicado") + " quitado" + (parsed.dupes === 1 ? "" : "s") : "")
+      : "";
+
     if (list.length < 2){
       $("winnerBox").classList.add("show");
-      $("winnerName").textContent = list.length === 1 ? "Necesitás 2 o más" : "Pegá la lista primero";
+      $("winnerName").textContent = list.length === 1 ? "Necesitás 2 o más" : "Pegá los registros primero";
+      $("winnerMeta").textContent = "";
       return;
     }
+
     spinning = true;
     $("winnerBox").classList.add("show");
+    $("winnerMeta").textContent = "";
     var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    var winner = list[Math.floor(Math.random()*list.length)];
-    if (reduce){ $("winnerName").textContent = winner; spinning = false; launchConfetti(); return; }
-    var ticks = 22, i = 0;
+    var winner = list[Math.floor(Math.random() * list.length)];
+    if (reduce){ showWinner(winner); spinning = false; launchConfetti(); return; }
+
+    var ticks = 24, i = 0;
     (function step(){
-      $("winnerName").textContent = list[Math.floor(Math.random()*list.length)];
+      $("winnerName").textContent = list[Math.floor(Math.random() * list.length)].nombre;
+      $("winnerMeta").textContent = "";
       i++;
-      if (i < ticks){ setTimeout(step, 60 + i*9); }
-      else { $("winnerName").textContent = winner; spinning = false; launchConfetti(); }
+      if (i < ticks){ setTimeout(step, 55 + i * 9); }
+      else { showWinner(winner); spinning = false; launchConfetti(); }
     })();
   }
 
